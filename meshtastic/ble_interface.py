@@ -10,7 +10,7 @@ from threading import Thread
 from typing import List, Optional
 
 import google.protobuf
-from bleak import BleakClient, BleakScanner, BLEDevice
+from bleak import BleakClient, BleakScanner, BLEDevice, AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
 
 from meshtastic.mesh_interface import MeshInterface
@@ -43,6 +43,7 @@ class BLEInterface(MeshInterface):
             self, debugOut=debugOut, noProto=noProto, noNodes=noNodes
         )
 
+        self.closing = False
         self.should_read = False
 
         logger.debug("Threads starting")
@@ -62,12 +63,19 @@ class BLEInterface(MeshInterface):
             self.close()
             raise e
 
+        # We MUST run atexit (if we can) because otherwise (at least on linux) the BLE device is not disconnected
+        # and future connection attempts will fail.  (BlueZ kinda sucks)
+        # Note: the on disconnected callback will call our self.close which will make us nicely wait for threads to exit
+        self._exit_handler = atexit.register(self.client.disconnect)
+
         if self.client.has_characteristic(LEGACY_LOGRADIO_UUID):
+            logger.debug("start_notify legacy_log_radio_handler")
             self.client.start_notify(
                 LEGACY_LOGRADIO_UUID, self.legacy_log_radio_handler
             )
 
         if self.client.has_characteristic(LOGRADIO_UUID):
+            logger.debug("start_notify log_radio_handler")
             self.client.start_notify(LOGRADIO_UUID, self.log_radio_handler)
 
         logger.debug("Mesh configure starting")
@@ -79,13 +87,10 @@ class BLEInterface(MeshInterface):
         logger.debug("Register FROMNUM notify callback")
         self.client.start_notify(FROMNUM_UUID, self.from_num_handler)
 
-        # We MUST run atexit (if we can) because otherwise (at least on linux) the BLE device is not disconnected
-        # and future connection attempts will fail.  (BlueZ kinda sucks)
-        # Note: the on disconnected callback will call our self.close which will make us nicely wait for threads to exit
-        self._exit_handler = atexit.register(self.client.disconnect)
+        logger.debug("init complete")
 
     def __repr__(self):
-        rep = f"BLEInterface(address={self.client.address if self.client else None!r}"
+        rep = f"BLEInterface(address={self.client.bleak_client.address if self.client and self.client.bleak_client else None!r}"
         if self.debugOut is not None:
             rep += f", debugOut={self.debugOut!r}"
         if self.noProto:
@@ -140,18 +145,34 @@ class BLEInterface(MeshInterface):
             )
             return list(map(lambda d: d[0], devices))
 
+    def _find_device_without_scan(self, address_or_name: str):
+        """
+        Find a ble device with out a search, instead use a filter function
+        :param address_or_name: address or name of a ble device
+        :exception BLEInterface.BLEError: if no device is found for that address_or_name
+        """
+        with BLEClient() as client:
+            logger.info(f"Searching for BLE device with address/name: {address_or_name} (10 seconds timeout)...")
+            timer_start = time.perf_counter()
+
+            device = client.discover_by_filter(address_or_name=address_or_name, timeout=10, service_uuids=[SERVICE_UUID])
+            if not device:
+                raise BLEInterface.BLEError(
+                    f"No Meshtastic BLE peripheral with identifier or address '{address_or_name}' found. Try --ble-scan to find it."
+                )
+
+            logger.debug(f"Found: '{device}' after: {time.perf_counter() - timer_start}s")
+            return device
+
     def find_device(self, address: Optional[str]) -> BLEDevice:
         """Find a device by address."""
 
-        addressed_devices = BLEInterface.scan()
-
+        # search by adress or name by a filter
         if address:
-            addressed_devices = list(
-                filter(
-                    lambda x: address in (x.name, x.address),
-                    addressed_devices,
-                )
-            )
+            return self._find_device_without_scan(address)
+
+        # scan for all meshtastic devices and if there is only one use it
+        addressed_devices = BLEInterface.scan()
 
         if len(addressed_devices) == 0:
             raise BLEInterface.BLEError(
@@ -173,11 +194,10 @@ class BLEInterface(MeshInterface):
     def connect(self, address: Optional[str] = None) -> "BLEClient":
         "Connect to a device by address."
 
-        # Bleak docs recommend always doing a scan before connecting (even if we know addr)
         device = self.find_device(address)
         client = BLEClient(device.address, disconnected_callback=lambda _: self.close())
         client.connect()
-        client.discover()
+        # client.discover()
         return client
 
     def _receiveFromRadioImpl(self) -> None:
@@ -216,8 +236,8 @@ class BLEInterface(MeshInterface):
 
     def _sendToRadioImpl(self, toRadio) -> None:
         b: bytes = toRadio.SerializeToString()
-        if b and self.client:  # we silently ignore writes while we are shutting down
-            logger.debug(f"TORADIO write: {b.hex()}")
+        if b and self.client and not self.closing:  # we silently ignore writes while we are shutting down
+            logger.debug(f"write: {toRadio} -> {b.hex()}")
             try:
                 self.client.write_gatt_char(
                     TORADIO_UUID, b, response=True
@@ -232,25 +252,38 @@ class BLEInterface(MeshInterface):
             self.should_read = True
 
     def close(self) -> None:
+        if self.closing:
+            # already called close, self.client.disconnect() (disconnected_callback) sends us back to this close() again
+            return
+
         try:
-            MeshInterface.close(self)
-        except Exception as e:
-            logger.error(f"Error closing mesh interface: {e}")
+            logger.debug("closing...")
+            self.closing = True
 
-        if self._want_receive:
-            self._want_receive = False  # Tell the thread we want it to stop
-            if self._receiveThread:
-                self._receiveThread.join(
-                    timeout=2
-                )  # If bleak is hung, don't wait for the thread to exit (it is critical we disconnect)
-                self._receiveThread = None
+            try:
+                MeshInterface.close(self)
+            except Exception as e:
+                logger.error(f"Error closing mesh interface: {e}")
 
-        if self.client:
-            atexit.unregister(self._exit_handler)
-            self.client.disconnect()
-            self.client.close()
-            self.client = None
-        self._disconnected() # send the disconnected indicator up to clients
+            if self._want_receive:
+                self._want_receive = False  # Tell the thread we want it to stop
+                if self._receiveThread:
+                    self._receiveThread.join(
+                        timeout=2
+                    )  # If bleak is hung, don't wait for the thread to exit (it is critical we disconnect)
+                    self._receiveThread = None
+
+            if self.client:
+                atexit.unregister(self._exit_handler)
+                self.client.bleak_client.set_disconnected_callback(None)
+                self.client.disconnect()
+                self.client.close()
+                self.client = None
+            self._disconnected() # send the disconnected indicator up to clients
+
+            logger.debug("closed")
+        finally:
+            self.closing = False
 
 
 class BLEClient:
@@ -272,6 +305,28 @@ class BLEClient:
     def discover(self, **kwargs):  # pylint: disable=C0116
         return self.async_await(BleakScanner.discover(**kwargs))
 
+    def _filter_ble_device(self, address_or_name: str, ble_device: BLEDevice, advertisement_data: AdvertisementData):
+        """
+        Filter for BleakScanner.find_device_by_filter method
+        :param address_or_name: address or a name of a ble device for filtering
+        :param ble_device: a ble device
+        :param advertisement_data: the advertisement data from the ble device
+        :return: True if the address is in [ble_device.address, ble_device.name, advertisement_data.local_name]
+        """
+        # bleak sometimes returns devices we didn't ask for, so filter also again for SERVICE_UUID to only return true meshtastic devices
+        return SERVICE_UUID in advertisement_data.service_uuids and address_or_name in (
+            ble_device.address, ble_device.name, advertisement_data.local_name)
+
+    def discover_by_filter(self, address_or_name: str, **kwargs) -> BLEDevice | None:
+        """
+        Search for a ble device by address or name
+        :param address_or_name: could be an a address or a name
+        :param kwargs: parameter for BleakScanner.find_device_by_filter
+        :return:
+        """
+        return self.async_await(BleakScanner.find_device_by_filter(
+            filterfunc=lambda ble_device, advertisement_data: self._filter_ble_device(address_or_name, ble_device, advertisement_data), **kwargs))
+
     def pair(self, **kwargs):  # pylint: disable=C0116
         return self.async_await(self.bleak_client.pair(**kwargs))
 
@@ -292,7 +347,7 @@ class BLEClient:
         return bool(self.bleak_client.services.get_characteristic(specifier))
 
     def start_notify(self, *args, **kwargs):  # pylint: disable=C0116
-        self.async_await(self.bleak_client.start_notify(*args, **kwargs))
+        self.async_run(self.bleak_client.start_notify(*args, **kwargs))
 
     def close(self):  # pylint: disable=C0116
         self.async_run(self._stop_event_loop())
