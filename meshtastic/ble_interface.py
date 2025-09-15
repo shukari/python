@@ -197,7 +197,6 @@ class BLEInterface(MeshInterface):
         device = self.find_device(address)
         client = BLEClient(device.address, disconnected_callback=lambda _: self.close())
         client.connect()
-        # client.discover()
         return client
 
     def _receiveFromRadioImpl(self) -> None:
@@ -262,6 +261,7 @@ class BLEInterface(MeshInterface):
 
             try:
                 MeshInterface.close(self)
+                logger.debug("MeshInterface.closed")
             except Exception as e:
                 logger.error(f"Error closing mesh interface: {e}")
 
@@ -273,12 +273,16 @@ class BLEInterface(MeshInterface):
                     )  # If bleak is hung, don't wait for the thread to exit (it is critical we disconnect)
                     self._receiveThread = None
 
+                logger.debug("_receiveThread closed")
+
             if self.client:
                 atexit.unregister(self._exit_handler)
-                self.client.bleak_client.set_disconnected_callback(None)
                 self.client.disconnect()
                 self.client.close()
                 self.client = None
+
+                logger.debug("client closed")
+
             self._disconnected() # send the disconnected indicator up to clients
 
             logger.debug("closed")
@@ -300,7 +304,7 @@ class BLEClient:
             logger.debug("No address provided - only discover method will work.")
             return
 
-        self.bleak_client = BleakClient(address, **kwargs)
+        self.bleak_client = BleakClient(address, pair=True, **kwargs)
 
     def discover(self, **kwargs):  # pylint: disable=C0116
         return self.async_await(BleakScanner.discover(**kwargs))
@@ -333,8 +337,8 @@ class BLEClient:
     def connect(self, **kwargs):  # pylint: disable=C0116
         return self.async_await(self.bleak_client.connect(**kwargs))
 
-    def disconnect(self, **kwargs):  # pylint: disable=C0116
-        self.async_await(self.bleak_client.disconnect(**kwargs))
+    def disconnect(self):  # pylint: disable=C0116
+        self.async_await(self.bleak_client.disconnect())
 
     def read_gatt_char(self, *args, **kwargs):  # pylint: disable=C0116
         return self.async_await(self.bleak_client.read_gatt_char(*args, **kwargs))
@@ -347,7 +351,7 @@ class BLEClient:
         return bool(self.bleak_client.services.get_characteristic(specifier))
 
     def start_notify(self, *args, **kwargs):  # pylint: disable=C0116
-        self.async_run(self.bleak_client.start_notify(*args, **kwargs))
+        self.async_await(self.bleak_client.start_notify(*args, **kwargs))
 
     def close(self):  # pylint: disable=C0116
         self.async_run(self._stop_event_loop())
